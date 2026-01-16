@@ -1,4 +1,4 @@
-// Copyright 2019-2025 The NATS Authors
+// Copyright 2019-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -829,9 +829,9 @@ func (a *Account) addStreamWithAssignment(config *StreamConfig, fsConfig *FileSt
 
 	// Add created timestamp used for the store, must match that of the stream assignment if it exists.
 	if sa != nil {
-		js.mu.RLock()
+		// The following assignment does not require mutex
+		// protection: sa.Created is immutable.
 		mset.created = sa.Created
-		js.mu.RUnlock()
 	}
 
 	// Start our signaling routine to process consumers.
@@ -1583,6 +1583,7 @@ func (s *Server) checkStreamCfg(config *StreamConfig, acc *Account, pedantic boo
 	if cfg.MaxAge != 0 && cfg.MaxAge < 100*time.Millisecond {
 		return StreamConfig{}, NewJSStreamInvalidConfigError(fmt.Errorf("max age needs to be >= 100ms"))
 	}
+
 	if cfg.Duplicates == 0 && cfg.Mirror == nil && len(cfg.Sources) == 0 {
 		maxWindow := StreamDefaultDuplicatesWindow
 		if lim.Duplicates > 0 && maxWindow > lim.Duplicates {
@@ -1815,7 +1816,7 @@ func (s *Server) checkStreamCfg(config *StreamConfig, acc *Account, pedantic boo
 	// check for duplicates
 	var iNames = make(map[string]struct{})
 	for _, src := range cfg.Sources {
-		if !isValidName(src.Name) {
+		if src == nil || !isValidName(src.Name) {
 			return StreamConfig{}, NewJSSourceInvalidStreamNameError()
 		}
 		if _, ok := iNames[src.composeIName()]; !ok {
@@ -3149,7 +3150,6 @@ func (mset *stream) setupMirrorConsumer() error {
 	}
 
 	mirror := mset.mirror
-	mirrorWg := &mirror.wg
 
 	// We want to throttle here in terms of how fast we request new consumers,
 	// or if the previous is still in progress.
@@ -3308,7 +3308,16 @@ func (mset *stream) setupMirrorConsumer() error {
 
 		// Wait for previous processMirrorMsgs go routine to be completely done.
 		// If none is running, this will not block.
-		mirrorWg.Wait()
+		mset.mu.Lock()
+		if mset.mirror == nil {
+			// Mirror config has been removed.
+			mset.mu.Unlock()
+			return
+		} else {
+			wg := &mset.mirror.wg
+			mset.mu.Unlock()
+			wg.Wait()
+		}
 
 		select {
 		case ccr := <-respCh:
@@ -7480,14 +7489,18 @@ func (mset *stream) partitionUnique(name string, partitions []string) bool {
 			if n == name {
 				continue
 			}
+			o.mu.RLock()
 			if o.subjf == nil {
+				o.mu.RUnlock()
 				return false
 			}
 			for _, filter := range o.subjf {
 				if SubjectsCollide(partition, filter.subject) {
+					o.mu.RUnlock()
 					return false
 				}
 			}
+			o.mu.RUnlock()
 		}
 	}
 	return true
