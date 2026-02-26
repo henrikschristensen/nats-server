@@ -115,6 +115,35 @@ func TestStoreMsgLoadNextMsgMulti(t *testing.T) {
 	)
 }
 
+func TestStoreLoadNextMsgWildcardStartBeforeFirstMatch(t *testing.T) {
+	testAllStoreAllPermutations(
+		t, false,
+		StreamConfig{Name: "zzz", Subjects: []string{"bar.*", "foo.*"}},
+		func(t *testing.T, fs StreamStore) {
+			// Fill non-matching subjects first so the first wildcard match starts
+			// strictly after the requested start sequence.
+			for i := 0; i < 100; i++ {
+				subj := fmt.Sprintf("bar.%d", i)
+				_, _, err := fs.StoreMsg(subj, nil, nil, 0)
+				require_NoError(t, err)
+			}
+			seq, _, err := fs.StoreMsg("foo.1", nil, nil, 0)
+			require_NoError(t, err)
+			require_Equal(t, seq, uint64(101))
+
+			var smv StoreMsg
+			sm, nseq, err := fs.LoadNextMsg("foo.*", true, 1, &smv)
+			require_NoError(t, err)
+			require_Equal(t, sm.subj, "foo.1")
+			require_Equal(t, nseq, uint64(101))
+
+			_, nseq, err = fs.LoadNextMsg("foo.*", true, nseq+1, &smv)
+			require_Error(t, err)
+			require_Equal(t, nseq, uint64(101))
+		},
+	)
+}
+
 func TestStoreDeleteSlice(t *testing.T) {
 	ds := DeleteSlice{2}
 	var deletes []uint64
@@ -885,6 +914,42 @@ func TestStoreGetSeqFromTimeWithTrailingDeletes(t *testing.T) {
 			require_NoError(t, err)
 			ts := time.Unix(0, start).UTC()
 			require_Equal(t, fs.GetSeqFromTime(ts), 2)
+		},
+	)
+}
+
+func TestFileStoreMultiLastSeqsAndLoadLastMsgWithLazySubjectState(t *testing.T) {
+	testAllStoreAllPermutations(
+		t, false,
+		StreamConfig{Name: "zzz", Subjects: []string{"foo"}},
+		func(t *testing.T, fs StreamStore) {
+			for range 3 {
+				_, _, err := fs.StoreMsg("foo", nil, nil, 0)
+				require_NoError(t, err)
+			}
+			seqs, err := fs.MultiLastSeqs([]string{"foo"}, 0, 0)
+			require_NoError(t, err)
+			require_Equal(t, len(seqs), 1)
+			require_Equal(t, seqs[0], 3)
+
+			_, err = fs.RemoveMsg(3)
+			require_NoError(t, err)
+			seqs, err = fs.MultiLastSeqs([]string{"foo"}, 0, 0)
+			require_NoError(t, err)
+			require_Equal(t, len(seqs), 1)
+			require_Equal(t, seqs[0], 2)
+
+			_, _, err = fs.StoreMsg("foo", nil, nil, 0)
+			require_NoError(t, err)
+			sm, err := fs.LoadLastMsg("foo", nil)
+			require_NoError(t, err)
+			require_Equal(t, sm.seq, 4)
+
+			_, err = fs.RemoveMsg(4)
+			require_NoError(t, err)
+			sm, err = fs.LoadLastMsg("foo", nil)
+			require_NoError(t, err)
+			require_Equal(t, sm.seq, 2)
 		},
 	)
 }

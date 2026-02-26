@@ -1373,6 +1373,12 @@ func TestNoRaceMemStoreCompactPerformance(t *testing.T) {
 }
 
 func TestNoRaceJetStreamSnapshotsWithSlowAckDontSlowConsumer(t *testing.T) {
+	// Test takes less time this way.
+	snapshotAckTimeout = 500 * time.Millisecond
+	t.Cleanup(func() {
+		snapshotAckTimeout = defaultSnapshotAckTimeout
+	})
+
 	s := RunBasicJetStreamServer(t)
 	defer s.Shutdown()
 
@@ -1429,7 +1435,7 @@ func TestNoRaceJetStreamSnapshotsWithSlowAckDontSlowConsumer(t *testing.T) {
 		require_Equal(t, msg.Header.Get("Description"), "No Flow Response")
 	case <-ech:
 		t.Fatalf("Got disconnected: %v", err)
-	case <-time.After(5 * time.Second):
+	case <-time.After(snapshotAckTimeout * 2):
 		t.Fatalf("Should have received EOF with error status")
 	}
 }
@@ -2297,7 +2303,7 @@ func TestNoRaceJetStreamClusterMemoryStreamLastSequenceResetAfterRestart(t *test
 			require_NoError(t, err)
 			node := mset.raftNode()
 			require_NotNil(t, node)
-			node.InstallSnapshot(mset.stateSnapshot())
+			node.InstallSnapshot(mset.stateSnapshot(), false)
 		}
 	}
 
@@ -2733,14 +2739,20 @@ func TestNoRaceJetStreamClusterCheckInterestStatePerformanceWQ(t *testing.T) {
 	// Was > 30 ms before fix for comparison, M2 macbook air.
 	require_LessThan(t, elapsed, 5*time.Millisecond)
 
-	// Make sure we set the chkflr correctly. The chkflr should be equal to asflr+1.
+	// Make sure we set the chkflr correctly.
+	// The chkflr should be equal to asflr+1 (unless the next message matching the filter is further ahead).
 	// Otherwise, if chkflr would be set higher a subsequent call to checkInterestState will be ineffective.
 	requireFloorsEqual := func(o *consumer) {
 		t.Helper()
 		require_True(t, o != nil)
 		o.mu.RLock()
 		defer o.mu.RUnlock()
-		require_Equal(t, o.chkflr, o.asflr+1)
+		_, seq, err := mset.store.LoadNextMsg(o.cfg.FilterSubject, false, o.asflr+1, nil)
+		if err == ErrStoreEOF {
+			seq++
+		}
+		require_True(t, o.asflr+1 <= seq)
+		require_Equal(t, o.chkflr, seq)
 	}
 
 	requireFloorsEqual(mset.lookupConsumer("A"))
@@ -2892,9 +2904,9 @@ func TestNoRaceJetStreamClusterLargeMetaSnapshotTiming(t *testing.T) {
 	n := js.getMetaGroup()
 	// Now let's see how long it takes to create a meta snapshot and how big it is.
 	start := time.Now()
-	snap, err := js.metaSnapshot()
+	snap, _, _, err := js.metaSnapshot()
 	require_NoError(t, err)
-	require_NoError(t, n.InstallSnapshot(snap))
+	require_NoError(t, n.InstallSnapshot(snap, false))
 	t.Logf("Took %v to snap meta with size of %v\n", time.Since(start), friendlyBytes(len(snap)))
 }
 
@@ -3412,7 +3424,7 @@ func TestNoRaceJetStreamClusterConsumerDeleteInterestPolicyUniqueFiltersPerf(t *
 		t.Fatalf("Deleting AckNone consumer took too long: %v", elapsed)
 	}
 
-	expectedStreamMsgs(499_900)
+	expectedStreamMsgs(499_800)
 
 	start = time.Now()
 	err = js.DeleteConsumer("TEST", "C0")

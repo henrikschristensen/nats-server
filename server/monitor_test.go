@@ -2008,7 +2008,7 @@ func TestMonitorConnzClosedConnsBadClient(t *testing.T) {
 
 	opts := s.getOpts()
 
-	rc, err := net.Dial("tcp", fmt.Sprintf("%s:%d", opts.Host, opts.Port))
+	rc, err := net.Dial("tcp", net.JoinHostPort(opts.Host, fmt.Sprintf("%d", opts.Port)))
 	if err != nil {
 		t.Fatalf("Error on dial: %v", err)
 	}
@@ -2057,7 +2057,7 @@ func TestMonitorConnzClosedConnsBadTLSClient(t *testing.T) {
 
 	opts = s.getOpts()
 
-	rc, err := net.Dial("tcp", fmt.Sprintf("%s:%d", opts.Host, opts.Port))
+	rc, err := net.Dial("tcp", net.JoinHostPort(opts.Host, fmt.Sprintf("%d", opts.Port)))
 	if err != nil {
 		t.Fatalf("Error on dial: %v", err)
 	}
@@ -2267,7 +2267,7 @@ func TestMonitorConnzTLSInHandshake(t *testing.T) {
 	defer s.Shutdown()
 
 	// Create bare TCP connection to delay client TLS handshake
-	c, err := net.Dial("tcp", fmt.Sprintf("%s:%d", opts.Host, opts.Port))
+	c, err := net.Dial("tcp", net.JoinHostPort(opts.Host, fmt.Sprintf("%d", opts.Port)))
 	if err != nil {
 		t.Fatalf("Error on dial: %v", err)
 	}
@@ -5347,8 +5347,8 @@ func TestMonitorJsz(t *testing.T) {
 			for _, srv := range srvs {
 				if js := srv.getJetStream(); js != nil {
 					if mg := js.getMetaGroup(); mg != nil {
-						if snap, err := js.metaSnapshot(); err == nil {
-							mg.InstallSnapshot(snap)
+						if snap, _, _, err := js.metaSnapshot(); err == nil {
+							mg.InstallSnapshot(snap, false)
 						}
 					}
 				}
@@ -6308,6 +6308,152 @@ func TestMonitorHealthzStatusUnavailable(t *testing.T) {
 			})
 		})
 	}
+}
+
+func TestServerHealthz(t *testing.T) {
+	t.Run("BasicHealth", func(t *testing.T) {
+		s := runMonitorServer()
+		defer s.Shutdown()
+
+		// Test with nil options
+		status := s.Healthz(nil)
+		if status == nil {
+			t.Fatal("Expected non-nil HealthStatus")
+		}
+		if status.Status != "ok" {
+			t.Fatalf("Expected status 'ok', got %q", status.Status)
+		}
+		if status.StatusCode != http.StatusOK {
+			t.Fatalf("Expected status code %d, got %d", http.StatusOK, status.StatusCode)
+		}
+
+		// Test with empty options
+		status = s.Healthz(&HealthzOptions{})
+		if status == nil {
+			t.Fatal("Expected non-nil HealthStatus")
+		}
+		if status.Status != "ok" {
+			t.Fatalf("Expected status 'ok', got %q", status.Status)
+		}
+
+		// Test with JSServerOnly option
+		status = s.Healthz(&HealthzOptions{JSServerOnly: true})
+		if status == nil {
+			t.Fatal("Expected non-nil HealthStatus")
+		}
+		if status.Status != "ok" {
+			t.Fatalf("Expected status 'ok', got %q", status.Status)
+		}
+	})
+
+	t.Run("BadRequestMissingAccount", func(t *testing.T) {
+		s := runMonitorServer()
+		defer s.Shutdown()
+
+		// Stream without account should return bad request
+		status := s.Healthz(&HealthzOptions{Stream: "TEST"})
+		if status.StatusCode != http.StatusBadRequest {
+			t.Fatalf("Expected status code %d, got %d", http.StatusBadRequest, status.StatusCode)
+		}
+		if status.Status != "error" {
+			t.Fatalf("Expected status 'error', got %q", status.Status)
+		}
+	})
+
+	t.Run("BadRequestMissingStream", func(t *testing.T) {
+		s := runMonitorServer()
+		defer s.Shutdown()
+
+		// Consumer without stream should return bad request
+		status := s.Healthz(&HealthzOptions{Account: "ACC", Consumer: "TEST"})
+		if status.StatusCode != http.StatusBadRequest {
+			t.Fatalf("Expected status code %d, got %d", http.StatusBadRequest, status.StatusCode)
+		}
+		if status.Status != "error" {
+			t.Fatalf("Expected status 'error', got %q", status.Status)
+		}
+	})
+
+	t.Run("DetailsOption", func(t *testing.T) {
+		s := runMonitorServer()
+		defer s.Shutdown()
+
+		// Test with Details option - should still return ok for healthy server
+		status := s.Healthz(&HealthzOptions{Details: true})
+		if status == nil {
+			t.Fatal("Expected non-nil HealthStatus")
+		}
+		if status.Status != "ok" {
+			t.Fatalf("Expected status 'ok', got %q", status.Status)
+		}
+
+		// Test bad request with details - should populate Errors slice
+		status = s.Healthz(&HealthzOptions{Stream: "TEST", Details: true})
+		if status.StatusCode != http.StatusBadRequest {
+			t.Fatalf("Expected status code %d, got %d", http.StatusBadRequest, status.StatusCode)
+		}
+		if len(status.Errors) == 0 {
+			t.Fatal("Expected Errors slice to be populated with Details=true")
+		}
+		if status.Errors[0].Type != HealthzErrorBadRequest {
+			t.Fatalf("Expected error type %v, got %v", HealthzErrorBadRequest, status.Errors[0].Type)
+		}
+	})
+
+	t.Run("ServerNotReady", func(t *testing.T) {
+		s := runMonitorServer()
+		defer s.Shutdown()
+
+		// Simulate server not ready by removing listener
+		s.mu.Lock()
+		sl := s.listener
+		s.listener = nil
+		s.mu.Unlock()
+
+		status := s.Healthz(nil)
+		if status.StatusCode != http.StatusInternalServerError {
+			t.Fatalf("Expected status code %d, got %d", http.StatusInternalServerError, status.StatusCode)
+		}
+		if status.Status != "error" {
+			t.Fatalf("Expected status 'error', got %q", status.Status)
+		}
+
+		// Restore for proper shutdown
+		s.mu.Lock()
+		s.listener = sl
+		s.mu.Unlock()
+	})
+
+	t.Run("JetStreamUnavailable", func(t *testing.T) {
+		opts := DefaultMonitorOptions()
+		opts.JetStream = true
+		s := RunServer(opts)
+		defer s.Shutdown()
+
+		if !s.JetStreamEnabled() {
+			t.Fatalf("want JetStream to be enabled first")
+		}
+
+		err := s.DisableJetStream()
+		if err != nil {
+			t.Fatalf("got an error disabling JetStream: %v", err)
+		}
+
+		// Should report unavailable when JS is disabled
+		status := s.Healthz(nil)
+		if status.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("Expected status code %d, got %d", http.StatusServiceUnavailable, status.StatusCode)
+		}
+		if status.Status != "unavailable" {
+			t.Fatalf("Expected status 'unavailable', got %q", status.Status)
+		}
+
+		// JSServerOnly should still report ok
+		status = s.Healthz(&HealthzOptions{JSServerOnly: true})
+		if status.Status != "ok" {
+			t.Fatalf("Expected status 'ok' with JSServerOnly, got %q", status.Status)
+		}
+	})
 }
 
 // When we converted ipq to use generics we still were using sync.Map. Currently you can not convert

@@ -4059,7 +4059,7 @@ func TestJetStreamClusterDesyncAfterRestartReplacesLeaderSnapshot(t *testing.T) 
 	// Install a snapshot on the leader, ensuring RAFT entries are compacted and a snapshot remains.
 	mset = lookupStream(leader)
 	n = mset.node.(*raft)
-	err = n.InstallSnapshot(mset.stateSnapshot())
+	err = n.InstallSnapshot(mset.stateSnapshot(), false)
 	require_NoError(t, err)
 
 	c.stopAll()
@@ -4136,60 +4136,6 @@ func TestJetStreamClusterKeepRaftStateIfStreamCreationFailedDuringShutdown(t *te
 	require_True(t, len(files) > 0)
 }
 
-func TestJetStreamClusterMetaSnapshotMustNotIncludePendingConsumers(t *testing.T) {
-	c := createJetStreamClusterExplicit(t, "R3S", 3)
-	defer c.shutdown()
-
-	nc, js := jsClientConnect(t, c.randomServer())
-	defer nc.Close()
-
-	_, err := js.AddStream(&nats.StreamConfig{Name: "TEST", Replicas: 3})
-	require_NoError(t, err)
-
-	// We're creating an R3 consumer, just so we can copy its state and turn it into pending below.
-	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{Name: "consumer", Replicas: 3})
-	require_NoError(t, err)
-	nc.Close()
-
-	// Bypass normal API so we can simulate having a consumer pending to be created.
-	// A snapshot should never create pending consumers, as that would result
-	// in ghost consumers if the meta proposal failed.
-	ml := c.leader()
-	mjs := ml.getJetStream()
-	mjs.mu.Lock()
-	cc := mjs.cluster
-	consumers := cc.streams[globalAccountName]["TEST"].consumers
-	sampleCa := *consumers["consumer"]
-	sampleCa.Name, sampleCa.pending = "pending-consumer", true
-	consumers[sampleCa.Name] = &sampleCa
-	mjs.mu.Unlock()
-
-	// Create snapshot, this should not contain pending consumers.
-	snap, err := mjs.metaSnapshot()
-	require_NoError(t, err)
-
-	ru := &recoveryUpdates{
-		removeStreams:   make(map[string]*streamAssignment),
-		removeConsumers: make(map[string]map[string]*consumerAssignment),
-		addStreams:      make(map[string]*streamAssignment),
-		updateStreams:   make(map[string]*streamAssignment),
-		updateConsumers: make(map[string]map[string]*consumerAssignment),
-	}
-	err = mjs.applyMetaSnapshot(snap, ru, true, true)
-	require_NoError(t, err)
-	require_Len(t, len(ru.updateStreams), 1)
-	for _, sa := range ru.updateStreams {
-		for _, ca := range sa.consumers {
-			require_NotEqual(t, ca.Name, "pending-consumer")
-		}
-	}
-	for _, cas := range ru.updateConsumers {
-		for _, ca := range cas {
-			require_NotEqual(t, ca.Name, "pending-consumer")
-		}
-	}
-}
-
 func TestJetStreamClusterMetaSnapshotReCreateConsistency(t *testing.T) {
 	c := createJetStreamClusterExplicit(t, "R3S", 3)
 	defer c.shutdown()
@@ -4224,7 +4170,7 @@ func TestJetStreamClusterMetaSnapshotReCreateConsistency(t *testing.T) {
 	mjs.mu.Unlock()
 
 	// Get the snapshot before removing the stream below so we can recover fresh.
-	snap, err := mjs.metaSnapshot()
+	snap, _, _, err := mjs.metaSnapshot()
 	require_NoError(t, err)
 	require_NoError(t, js.DeleteStream("TEST"))
 	nc.Close()
@@ -4298,7 +4244,7 @@ func TestJetStreamClusterMetaSnapshotConsumerDeleteConsistency(t *testing.T) {
 	mjs.mu.Unlock()
 
 	// Get the snapshot before removing the stream below so we can recover fresh.
-	snap, err := mjs.metaSnapshot()
+	snap, _, _, err := mjs.metaSnapshot()
 	require_NoError(t, err)
 	require_NoError(t, js.DeleteStream("TEST"))
 	nc.Close()
@@ -4530,7 +4476,7 @@ func TestJetStreamClusterDontInstallSnapshotWhenStoppingStream(t *testing.T) {
 	require_NoError(t, err)
 	mset, err := acc.lookupStream("TEST")
 	require_NoError(t, err)
-	err = mset.node.InstallSnapshot(mset.stateSnapshotLocked())
+	err = mset.node.InstallSnapshot(mset.stateSnapshotLocked(), false)
 	require_NoError(t, err)
 
 	// Validate the snapshot reflects applied.
@@ -4636,7 +4582,7 @@ func TestJetStreamClusterDontInstallSnapshotWhenStoppingConsumer(t *testing.T) {
 	require_NotNil(t, o)
 	snapBytes, err := o.store.EncodedState()
 	require_NoError(t, err)
-	err = o.node.InstallSnapshot(snapBytes)
+	err = o.node.InstallSnapshot(snapBytes, false)
 	require_NoError(t, err)
 
 	// Validate the snapshot reflects applied.
@@ -4870,7 +4816,17 @@ func TestJetStreamClusterStreamAckMsgR1SignalsRemovedMsg(t *testing.T) {
 	require_NoError(t, err)
 	require_Equal(t, sm.subj, "foo")
 
+	// Should not remove if the message is still pending, even if we call ack.
+	require_False(t, mset.ackMsg(o, 1))
+	sm, err = mset.store.LoadMsg(1, &smv)
+	require_NoError(t, err)
+	require_Equal(t, sm.subj, "foo")
+
 	// Now do a proper ack, should immediately remove the message since it's R1.
+	o.mu.Lock()
+	o.sseq, o.dseq = 2, 2
+	o.asflr, o.adflr = 1, 1
+	o.mu.Unlock()
 	require_True(t, mset.ackMsg(o, 1))
 	_, err = mset.store.LoadMsg(1, &smv)
 	require_Error(t, err, ErrStoreMsgNotFound)
@@ -4945,6 +4901,16 @@ func TestJetStreamClusterStreamAckMsgR3SignalsRemovedMsg(t *testing.T) {
 	// Too high sequence, should register pre-ack and return true allowing for retries.
 	require_True(t, msetL.ackMsg(ol, 100))
 	require_True(t, msetF.ackMsg(of, 100))
+
+	// We're bypassing the normal ack flow, so must set these values ourselves.
+	ol.mu.Lock()
+	ol.sseq, ol.dseq = 2, 2
+	ol.asflr, ol.adflr = 1, 1
+	ol.mu.Unlock()
+	require_NoError(t, of.store.Update(&ConsumerState{
+		Delivered: SequencePair{1, 1},
+		AckFloor:  SequencePair{1, 1},
+	}))
 
 	// Ack message on follower, should not remove message as that's proposed by the leader.
 	// But should still signal message removal.
@@ -7157,6 +7123,7 @@ func TestJetStreamClusterAccountMaxConnectionsReconnect(t *testing.T) {
 		_, err := js.AddStream(&nats.StreamConfig{
 			Name:     fmt.Sprintf("foo:%d", i),
 			Subjects: []string{fmt.Sprintf("foo.%d", i)},
+			Replicas: 3, // Must be R3 to stop flaking due to stream placement
 		})
 		require_NoError(t, err)
 

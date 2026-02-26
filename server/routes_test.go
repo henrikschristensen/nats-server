@@ -1309,7 +1309,7 @@ func TestRouteCloseTLSConnection(t *testing.T) {
 	s := RunServer(opts)
 	defer s.Shutdown()
 
-	endpoint := fmt.Sprintf("%s:%d", opts.Cluster.Host, opts.Cluster.Port)
+	endpoint := net.JoinHostPort(opts.Cluster.Host, fmt.Sprintf("%d", opts.Cluster.Port))
 	conn, err := net.DialTimeout("tcp", endpoint, 2*time.Second)
 	if err != nil {
 		t.Fatalf("Unexpected error on dial: %v", err)
@@ -4744,7 +4744,7 @@ func TestRouteNoLeakOnAuthTimeout(t *testing.T) {
 	s := RunServer(opts)
 	defer s.Shutdown()
 
-	c, err := net.Dial("tcp", fmt.Sprintf("%s:%d", opts.Host, opts.Cluster.Port))
+	c, err := net.Dial("tcp", net.JoinHostPort(opts.Host, fmt.Sprintf("%d", opts.Cluster.Port)))
 	if err != nil {
 		t.Fatalf("Error connecting: %v", err)
 	}
@@ -5037,5 +5037,114 @@ func TestRouteConfigureWriteTimeoutPolicy(t *testing.T) {
 				}
 			})
 		})
+	}
+}
+
+// Benchmarks for message arg processing functions to measure heap allocations.
+// These functions parse incoming protocol messages and split arguments.
+
+func BenchmarkProcessRoutedMsgArgs(b *testing.B) {
+	// RMSG format: account subject [reply] size
+	arg := []byte("$G foo.bar _INBOX.xxx 1024")
+	c := &client{kind: ROUTER, route: &route{}}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if err := c.processRoutedMsgArgs(arg); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkProcessRoutedHeaderMsgArgs(b *testing.B) {
+	// HMSG format: account subject [reply] headerSize totalSize
+	arg := []byte("$G foo.bar 12 1024")
+	c := &client{kind: ROUTER, route: &route{}}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if err := c.processRoutedHeaderMsgArgs(arg); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkProcessRoutedOriginClusterMsgArgs(b *testing.B) {
+	// Origin cluster HMSG format: origin account subject [reply] headerSize totalSize
+	arg := []byte("ORIGIN MY_ACCOUNT foo.bar 12 345")
+	c := &client{kind: ROUTER, route: &route{}}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if err := c.processRoutedOriginClusterMsgArgs(arg); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkProcessLeafMsgArgs(b *testing.B) {
+	// LMSG format: subject [reply] size
+	arg := []byte("foo.bar _INBOX.xxx 1024")
+	c := &client{kind: LEAF}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if err := c.processLeafMsgArgs(arg); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkProcessLeafHeaderMsgArgs(b *testing.B) {
+	// Leaf HMSG format: subject headerSize totalSize
+	arg := []byte("foo.bar 12 1024")
+	c := &client{kind: LEAF}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if err := c.processLeafHeaderMsgArgs(arg); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// Benchmarks with queue subscribers to exercise the larger arg paths.
+
+func BenchmarkProcessRoutedMsgArgs_Queues(b *testing.B) {
+	// RMSG format with queues: account subject replyIndicator reply queue1 queue2 size
+	arg := []byte("$G foo.bar + _INBOX.xxx queue1 queue2 1024")
+	c := &client{kind: ROUTER, route: &route{}}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if err := c.processRoutedMsgArgs(arg); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkProcessRoutedHeaderMsgArgs_Queues(b *testing.B) {
+	// HMSG format with queues: account subject replyIndicator reply queue1 queue2 headerSize totalSize
+	arg := []byte("$G foo.bar + _INBOX.xxx queue1 queue2 12 1024")
+	c := &client{kind: ROUTER, route: &route{}}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if err := c.processRoutedHeaderMsgArgs(arg); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkProcessLeafMsgArgs_Queues(b *testing.B) {
+	// LMSG format with queues: subject replyIndicator reply queue1 queue2 size
+	arg := []byte("foo.bar + _INBOX.xxx queue1 queue2 1024")
+	c := &client{kind: LEAF}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if err := c.processLeafMsgArgs(arg); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
