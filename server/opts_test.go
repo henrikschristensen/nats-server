@@ -1,4 +1,4 @@
-// Copyright 2012-2025 The NATS Authors
+// Copyright 2012-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -76,6 +76,7 @@ func TestDefaultOptions(t *testing.T) {
 		JetStreamMaxStore:          -1,
 		SyncInterval:               2 * time.Minute,
 		JetStreamRequestQueueLimit: JSDefaultRequestQueueLimit,
+		JetStreamInfoQueueLimit:    JSDefaultRequestQueueLimit,
 	}
 
 	opts := &Options{}
@@ -124,7 +125,8 @@ func TestConfigFile(t *testing.T) {
 		ConnectErrorReports:   86400,
 		ReconnectErrorReports: 5,
 		Metadata:              map[string]string{"key1": "value1", "key2": "value2"},
-		configDigest:          "sha256:a1104db0c8e838096a4f0509ec4d1e7c2c26ff60261ecb8f6a12dde1317872c3",
+		FeatureFlags:          map[string]bool{"feature": false, "fix": true, "revert_fix": true},
+		configDigest:          "sha256:f10eacddb9ce83a6bdc79b42c851b9628d49cf8b3c6ba95b1ecf090307504948",
 		authBlockDefined:      true,
 	}
 
@@ -298,7 +300,8 @@ func TestMergeOverrides(t *testing.T) {
 		StoreDir:              "/store/dir",
 		authBlockDefined:      true,
 		Metadata:              map[string]string{"key1": "value1", "key2": "value2"},
-		configDigest:          "sha256:a1104db0c8e838096a4f0509ec4d1e7c2c26ff60261ecb8f6a12dde1317872c3",
+		FeatureFlags:          map[string]bool{"feature": false, "fix": true, "revert_fix": true},
+		configDigest:          "sha256:f10eacddb9ce83a6bdc79b42c851b9628d49cf8b3c6ba95b1ecf090307504948",
 	}
 	fopts, err := ProcessConfigFile("./configs/test.conf")
 	if err != nil {
@@ -2478,14 +2481,20 @@ func TestParsingLeafNodeRemotes(t *testing.T) {
 
 		content := `
 		port: -1
+		accounts: {
+			A { users [ {user: a, password: a} ]}
+			B { users [ {user: b, password: b} ]}
+		}
 		leafnodes {
 			remotes = [
 				{
 					dont_randomize: true
 					urls: %[1]s
+					account: "A"
 				}
 				{
 					urls: %[1]s
+					account: "B"
 				}
 			]
 		}
@@ -2495,10 +2504,16 @@ func TestParsingLeafNodeRemotes(t *testing.T) {
 		s, _ := RunServerWithConfig(conf)
 		defer s.Shutdown()
 
-		s.mu.Lock()
-		r1 := s.leafRemoteCfgs[0]
-		r2 := s.leafRemoteCfgs[1]
-		s.mu.Unlock()
+		var r1, r2 *leafNodeCfg
+		s.mu.RLock()
+		for r := range s.leafRemoteCfgs {
+			if r.NoRandomize {
+				r1 = r
+			} else {
+				r2 = r
+			}
+		}
+		s.mu.RUnlock()
 
 		r1.RLock()
 		gotOrdered := r1.urls
@@ -4356,4 +4371,322 @@ func TestEnvVarFromIncludedFile(t *testing.T) {
 	if opts.Port != 7890 {
 		t.Fatalf("Expected port 7890, found %d", opts.Port)
 	}
+}
+
+func TestRedactArgs(t *testing.T) {
+	var tests []struct {
+		name     string
+		input    []string
+		expected []string
+	}
+
+	for _, dash := range []string{"-", "--"} {
+		for _, tag := range []string{"user", "pass", "auth"} {
+			for _, value := range []string{"hello", "hello world"} {
+				flag := dash + tag
+				tests = append(tests, struct {
+					name     string
+					input    []string
+					expected []string
+				}{
+					name:     fmt.Sprintf("%s%s-space-%q", dash, tag, value),
+					input:    []string{flag, value},
+					expected: []string{flag, "[REDACTED]"},
+				})
+				tests = append(tests, struct {
+					name     string
+					input    []string
+					expected []string
+				}{
+					name:     fmt.Sprintf("%s%s-equals-%q", dash, tag, value),
+					input:    []string{flag + "=" + value},
+					expected: []string{flag + "=[REDACTED]"},
+				})
+			}
+		}
+	}
+
+	for _, dash := range []string{"-", "--"} {
+		for _, test := range []struct {
+			name     string
+			tag      string
+			input    string
+			expected string
+		}{
+			{
+				name:     "routes-single",
+				tag:      "routes",
+				input:    "nats://ruser:s3cret@127.0.0.1:6222",
+				expected: "nats://[REDACTED]@127.0.0.1:6222",
+			},
+			{
+				name:     "routes-no-creds",
+				tag:      "routes",
+				input:    "nats://127.0.0.1:6222",
+				expected: "nats://127.0.0.1:6222",
+			},
+			{
+				name:     "routes-multi",
+				tag:      "routes",
+				input:    "nats://ruser:s3cret@127.0.0.1:6222, nats://ruser2:s3cret2@127.0.0.1:6223",
+				expected: "nats://[REDACTED]@127.0.0.1:6222,nats://[REDACTED]@127.0.0.1:6223",
+			},
+			{
+				name:     "cluster",
+				tag:      "cluster",
+				input:    "nats://cuser:s3cret@127.0.0.1:6224",
+				expected: "nats://[REDACTED]@127.0.0.1:6224",
+			},
+			{
+				name:     "cluster-no-creds",
+				tag:      "cluster",
+				input:    "nats://127.0.0.1:6224",
+				expected: "nats://127.0.0.1:6224",
+			},
+			{
+				name:     "cluster-comma-user",
+				tag:      "cluster",
+				input:    "nats://cuser,extra:s3cret@127.0.0.1:6224",
+				expected: "nats://[REDACTED]@127.0.0.1:6224",
+			},
+			{
+				name:     "cluster-random-port",
+				tag:      "cluster",
+				input:    "nats://cuser:s3cret@127.0.0.1:-1",
+				expected: "nats://[REDACTED]@127.0.0.1:-1",
+			},
+			{
+				name:     "cluster-listen",
+				tag:      "cluster_listen",
+				input:    "nats://luser:s3cret@127.0.0.1:6225",
+				expected: "nats://[REDACTED]@127.0.0.1:6225",
+			},
+			{
+				name:     "cluster-listen-comma-user",
+				tag:      "cluster_listen",
+				input:    "nats://luser,extra:s3cret@127.0.0.1:6225",
+				expected: "nats://[REDACTED]@127.0.0.1:6225",
+			},
+			{
+				name:     "cluster-listen-random-port",
+				tag:      "cluster_listen",
+				input:    "nats://luser:s3cret@127.0.0.1:-1",
+				expected: "nats://[REDACTED]@127.0.0.1:-1",
+			},
+		} {
+			tests = append(tests, struct {
+				name     string
+				input    []string
+				expected []string
+			}{
+				name:     fmt.Sprintf("%s%s-space", dash, test.name),
+				input:    []string{dash + test.tag, test.input},
+				expected: []string{dash + test.tag, test.expected},
+			})
+			tests = append(tests, struct {
+				name     string
+				input    []string
+				expected []string
+			}{
+				name:     fmt.Sprintf("%s%s-equals", dash, test.name),
+				input:    []string{dash + test.tag + "=" + test.input},
+				expected: []string{dash + test.tag + "=" + test.expected},
+			})
+		}
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			input := append([]string(nil), test.input...)
+			RedactArgs(input)
+			if !reflect.DeepEqual(input, test.expected) {
+				t.Fatalf("A %v\nB %v", test.expected, input)
+			}
+		})
+	}
+}
+
+func TestOptionsCompressionEqual(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		genOpts func() (*CompressionOpts, *CompressionOpts)
+		equal   bool
+	}{
+		{"same pointer", func() (*CompressionOpts, *CompressionOpts) {
+			c := &CompressionOpts{}
+			return c, c
+		}, true},
+		{"first nil", func() (*CompressionOpts, *CompressionOpts) {
+			return &CompressionOpts{}, nil
+		}, false},
+		{"second nil", func() (*CompressionOpts, *CompressionOpts) {
+			return nil, &CompressionOpts{}
+		}, false},
+		{"both nil", func() (*CompressionOpts, *CompressionOpts) {
+			return nil, nil
+		}, true},
+		{"different mode", func() (*CompressionOpts, *CompressionOpts) {
+			return &CompressionOpts{Mode: CompressionS2Fast},
+				&CompressionOpts{Mode: CompressionS2Best}
+		}, false},
+		{"same mode", func() (*CompressionOpts, *CompressionOpts) {
+			return &CompressionOpts{Mode: CompressionS2Best},
+				&CompressionOpts{Mode: CompressionS2Best}
+		}, true},
+		{"s2 auto c1 default rtt thresholds", func() (*CompressionOpts, *CompressionOpts) {
+			return &CompressionOpts{
+					Mode:          CompressionS2Auto,
+					RTTThresholds: defaultCompressionS2AutoRTTThresholds,
+				}, &CompressionOpts{
+					Mode: CompressionS2Auto,
+				}
+		}, true},
+		{"s2 auto c2 default rtt thresholds", func() (*CompressionOpts, *CompressionOpts) {
+			return &CompressionOpts{
+					Mode: CompressionS2Auto,
+				}, &CompressionOpts{
+					Mode:          CompressionS2Auto,
+					RTTThresholds: defaultCompressionS2AutoRTTThresholds,
+				}
+		}, true},
+		{"s2 auto same rtt thresholds", func() (*CompressionOpts, *CompressionOpts) {
+			return &CompressionOpts{
+					Mode:          CompressionS2Auto,
+					RTTThresholds: []time.Duration{5 * time.Millisecond, 10 * time.Millisecond},
+				}, &CompressionOpts{
+					Mode:          CompressionS2Auto,
+					RTTThresholds: []time.Duration{5 * time.Millisecond, 10 * time.Millisecond},
+				}
+		}, true},
+		{"s2 auto different rtt thresholds", func() (*CompressionOpts, *CompressionOpts) {
+			return &CompressionOpts{
+					Mode:          CompressionS2Auto,
+					RTTThresholds: []time.Duration{5 * time.Millisecond, 10 * time.Millisecond},
+				}, &CompressionOpts{
+					Mode:          CompressionS2Auto,
+					RTTThresholds: []time.Duration{15 * time.Millisecond, 30 * time.Millisecond},
+				}
+		}, false},
+		{"s2 auto different rtt thresholds c1 not set", func() (*CompressionOpts, *CompressionOpts) {
+			return &CompressionOpts{
+					Mode: CompressionS2Auto,
+				}, &CompressionOpts{
+					Mode:          CompressionS2Auto,
+					RTTThresholds: []time.Duration{15 * time.Millisecond, 30 * time.Millisecond},
+				}
+		}, false},
+		{"s2 auto different rtt thresholds c2 not set", func() (*CompressionOpts, *CompressionOpts) {
+			return &CompressionOpts{
+					Mode:          CompressionS2Auto,
+					RTTThresholds: []time.Duration{15 * time.Millisecond, 30 * time.Millisecond},
+				}, &CompressionOpts{
+					Mode: CompressionS2Auto,
+				}
+		}, false},
+		{"s2 auto both rtt thresholds empty", func() (*CompressionOpts, *CompressionOpts) {
+			return &CompressionOpts{
+					Mode:          CompressionS2Auto,
+					RTTThresholds: []time.Duration{},
+				}, &CompressionOpts{
+					Mode:          CompressionS2Auto,
+					RTTThresholds: []time.Duration{},
+				}
+		}, true},
+		{"s2 auto both rtt thresholds nil", func() (*CompressionOpts, *CompressionOpts) {
+			return &CompressionOpts{
+					Mode: CompressionS2Auto,
+				}, &CompressionOpts{
+					Mode: CompressionS2Auto,
+				}
+		}, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			c1, c2 := test.genOpts()
+			res := c1.equals(c2)
+			require_Equal(t, test.equal, res)
+		})
+	}
+}
+
+func TestOptionsRemoteLeafNodeName(t *testing.T) {
+	u1, err := url.Parse("nats://user1:secretpwd@127.0.0.1:7222")
+	require_NoError(t, err)
+	u2, err := url.Parse("nats://user2:secretpwd@127.0.0.1:7222")
+	require_NoError(t, err)
+	// With unredacted versions of the URLs
+	urls := []*url.URL{u1, u2}
+	safeURLs := redactURLList(urls)
+	// Some Nkey
+	nkey := "SUACJN3OSKWWPQXME4JUNFJ3PARXPO657GGNWNU7PK7G3AUQQYHLW26XH4"
+	for _, test := range []struct {
+		name       string
+		input      *RemoteLeafOpts
+		output     string
+		safeOutput string
+	}{
+		{
+			"url only", &RemoteLeafOpts{
+				URLs: []*url.URL{u1, u2},
+			},
+			fmt.Sprintf("urls=%q, account=%q", urls, globalAccountName),
+			fmt.Sprintf("urls=%q, account=%q", safeURLs, globalAccountName),
+		},
+		{
+			"url with account", &RemoteLeafOpts{
+				URLs:         []*url.URL{u1, u2},
+				LocalAccount: "A",
+			},
+			fmt.Sprintf("urls=%q, account=%q", urls, "A"),
+			fmt.Sprintf("urls=%q, account=%q", safeURLs, "A"),
+		},
+		{
+			"url with credentials", &RemoteLeafOpts{
+				URLs:        []*url.URL{u1, u2},
+				Credentials: "credsfile",
+			},
+			fmt.Sprintf("urls=%q, account=%q, credentials=%q", urls, globalAccountName, "credsfile"),
+			fmt.Sprintf("urls=%q, account=%q, credentials=%q", safeURLs, globalAccountName, "credsfile"),
+		},
+		{
+			"url with nkey", &RemoteLeafOpts{
+				URLs: []*url.URL{u1, u2},
+				Nkey: nkey,
+			},
+			fmt.Sprintf("urls=%q, account=%q, nkey=%q", urls, globalAccountName, nkey),
+			fmt.Sprintf("urls=%q, account=%q, nkey=%q", safeURLs, globalAccountName, "[REDACTED]"),
+		},
+		{
+			"url with account and credentials", &RemoteLeafOpts{
+				URLs:         []*url.URL{u1, u2},
+				LocalAccount: "A",
+				Credentials:  "credsfile",
+			},
+			fmt.Sprintf("urls=%q, account=%q, credentials=%q", urls, "A", "credsfile"),
+			fmt.Sprintf("urls=%q, account=%q, credentials=%q", safeURLs, "A", "credsfile"),
+		},
+		{
+			"url with account and nkey", &RemoteLeafOpts{
+				URLs:         []*url.URL{u1, u2},
+				LocalAccount: "A",
+				Nkey:         nkey,
+			},
+			fmt.Sprintf("urls=%q, account=%q, nkey=%q", urls, "A", nkey),
+			fmt.Sprintf("urls=%q, account=%q, nkey=%q", safeURLs, "A", "[REDACTED]"),
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			name := test.input.name()
+			require_Equal(t, name, test.output)
+			name = test.input.safeName()
+			require_Equal(t, name, test.safeOutput)
+		})
+	}
+
+	// Because we use `%q` when building the name, those two will have different
+	// names:
+	// r1=urls=["nats://user1:secretpwd@127.0.0.1:7222"], account="A", credentials="creds"
+	// r2=urls=["nats://user1:secretpwd@127.0.0.1:7222"], account="A\", credentials=\"creds"
+	r1 := &RemoteLeafOpts{URLs: []*url.URL{u1}, LocalAccount: "A", Credentials: "creds"}
+	r2 := &RemoteLeafOpts{URLs: []*url.URL{u1}, LocalAccount: `A", credentials="creds`}
+	require_False(t, r1.name() == r2.name())
 }

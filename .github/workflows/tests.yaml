@@ -16,55 +16,9 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/heads/release/') }}
 
 jobs:
-  signoffs:
-    name: Sign-offs
-    runs-on: ${{ vars.GHA_WORKER_SMALL || 'ubuntu-latest' }}
-    if: github.ref != 'refs/heads/main'
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Check all branch commits are signed off
-        if: github.event_name != 'pull_request'
-        run: |
-          for c in $(git rev-list --no-merges ${{ github.event.before }}..${{ github.event.after }}); do
-            msg="$(git log -1 --pretty=%B "$c")"
-            if ! printf '%s\n' "$msg" | grep -q '^Signed-off-by:'; then
-              echo "::error ::Commit $c has not been signed off in the commit message with a \`Signed-off-by: Your Name <your.email@example.com>\` line"
-              git log -1 --pretty=format:"%h %s" "$c"
-              missing=1
-            fi
-          done
-          exit $missing
-
-      - name: Check all PR commits are signed off
-        if: github.event_name == 'pull_request'
-        run: |
-          for c in $(git rev-list origin/${{ github.base_ref }}..${{ github.event.pull_request.head.sha }}); do
-            msg="$(git log -1 --pretty=%B "$c")"
-            if ! printf '%s\n' "$msg" | grep -q '^Signed-off-by:'; then
-              echo "::error ::Commit $c has not been signed off in the commit message with a \`Signed-off-by: Your Name <your.email@example.com>\` line"
-              git log -1 --pretty=format:"%h %s" "$c"
-              missing=1
-            fi
-          done
-          exit $missing
-
-      - name: Check PR description is signed off
-        if: github.event_name == 'pull_request'
-        env:
-          PR_DESC: ${{ github.event.pull_request.body }}
-        run: |
-          grep -Pq '^Signed-off-by:\s*(?!Your Name|.*<your\.email@example\.com>)' <<<"$PR_DESC" || {
-          echo "::error ::Pull request has not been signed off in the PR description with a \`Signed-off-by:\` line"
-          exit 1
-          }
-
   lint:
     name: Lint
-    runs-on: ${{ vars.GHA_WORKER_SMALL || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -86,7 +40,8 @@ jobs:
 
   build-latest:
     name: Build (Latest Go)
-    runs-on: ${{ vars.GHA_WORKER_SMALL || 'ubuntu-latest' }}
+    needs: [lint]
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -104,7 +59,8 @@ jobs:
 
   build-supported:
     name: Build (Minimum Go)
-    runs-on: ${{ vars.GHA_WORKER_SMALL || 'ubuntu-latest' }}
+    needs: [lint]
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -125,6 +81,7 @@ jobs:
   # only, as the Windows builds take a fair bit longer to set up.
   build-windows:
     name: Build (Minimum Go, ${{ matrix.os }})
+    needs: [lint]
     strategy:
       fail-fast: false
       matrix:

@@ -37,7 +37,8 @@ FROM --platform=$TARGETPLATFORM alpine:latest
 ARG TARGETOS
 ARG TARGETARCH
 
-COPY ./nats-server/docker/nats-server.conf                     /nats/conf/nats-server.conf
+RUN apk add --no-cache tzdata
+
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt         /etc/ssl/certs/
 COPY --from=builder /src/out/$TARGETOS/$TARGETARCH/nats-server /bin/nats-server
 COPY --from=builder /src/out/$TARGETOS/$TARGETARCH/nats        /bin/nats
@@ -46,4 +47,3 @@ COPY --from=builder /src/out/$TARGETOS/$TARGETARCH/nsc         /bin/nsc
 EXPOSE 4222 8222 6222 5222
 
 ENTRYPOINT ["/bin/nats-server"]
-CMD ["-c", "/nats/conf/nats-server.conf"]
