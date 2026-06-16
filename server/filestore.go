@@ -2177,7 +2177,9 @@ func (fs *fileStore) recoverTTLState() error {
 		ttlseq, err = fs.ttls.Decode(buf)
 		if err != nil {
 			fs.warn("Error decoding TTL state: %s", err)
+			// Remove the file, and reset collected state (if any).
 			_ = os.Remove(fn)
+			fs.ttls = thw.NewHashWheel()
 		}
 	}
 
@@ -2262,7 +2264,9 @@ func (fs *fileStore) recoverMsgSchedulingState() error {
 		schedSeq, err = fs.scheduling.decode(buf)
 		if err != nil {
 			fs.warn("Error decoding message scheduling state: %s", err)
+			// Remove the file, and reset collected state (if any).
 			_ = os.Remove(fn)
+			fs.scheduling = newMsgScheduling(fs.runMsgScheduling)
 		}
 	}
 
@@ -3791,10 +3795,11 @@ func (fs *fileStore) filterIsAll(filters []string) bool {
 		return false
 	}
 	// Sort so we can compare.
+	subjects := copyStrings(fs.cfg.Subjects)
 	slices.Sort(filters)
-	slices.Sort(fs.cfg.Subjects)
+	slices.Sort(subjects)
 	for i, subj := range filters {
-		if !subjectIsSubsetMatch(fs.cfg.Subjects[i], subj) {
+		if !subjectIsSubsetMatch(subjects[i], subj) {
 			return false
 		}
 	}
@@ -10457,8 +10462,24 @@ func (fs *fileStore) compact(seq uint64) (purged uint64, rerr error) {
 			buf := smb.cache.buf[moff:]
 			// Don't reuse, copy to new recycled buf.
 			nbuf := getMsgBlockBuf(len(buf))
+			// Recycle our nbuf when we are done.
+			defer recycleMsgBlockBuf(nbuf)
 			nbuf = append(nbuf, buf...)
 			smb.closeFDsLockedNoCheck()
+			// Check for compression.
+			if smb.cmp != NoCompression && len(nbuf) > 0 {
+				originalSize := len(nbuf)
+				if nbuf, err = smb.cmp.Compress(nbuf); err != nil {
+					smb.mu.Unlock()
+					fs.mu.Unlock()
+					return purged, err
+				}
+				meta := &CompressionInfo{
+					Algorithm:    smb.cmp,
+					OriginalSize: uint64(originalSize),
+				}
+				nbuf = append(meta.MarshalMetadata(), nbuf...)
+			}
 			// Check for encryption.
 			if smb.bek != nil && len(nbuf) > 0 {
 				// Recreate to reset counter.
@@ -10471,13 +10492,6 @@ func (fs *fileStore) compact(seq uint64) (purged uint64, rerr error) {
 				// For future writes make sure to set smb.bek to keep counter correct.
 				smb.bek = bek
 				smb.bek.XORKeyStream(nbuf, nbuf)
-			}
-			// Recompress if necessary (smb.cmp contains the algorithm used when
-			// the block was loaded from disk, or defaults to NoCompression if not)
-			if nbuf, err = smb.cmp.Compress(nbuf); err != nil {
-				smb.mu.Unlock()
-				fs.mu.Unlock()
-				return purged, err
 			}
 
 			// We will write to a new file and mv/rename it in case of failure.

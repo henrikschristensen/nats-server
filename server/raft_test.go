@@ -169,6 +169,26 @@ func TestNRGAppendEntryDecodeTruncatedEntryLength(t *testing.T) {
 	require_Error(t, err, errBadAppendEntry)
 }
 
+func TestNRGPeerStateDecodeTruncated(t *testing.T) {
+	ps := &peerState{knownPeers: []string{"12345678", "abcdefgh"}, clusterSize: 2}
+	buf := encodePeerState(ps)
+
+	// Sanity check the round trip.
+	dps, err := decodePeerState(buf)
+	require_NoError(t, err)
+	require_Equal(t, len(dps.knownPeers), 2)
+	require_Equal(t, dps.clusterSize, 2)
+
+	// Header claims one peer but only a partial id (idLen-5 bytes) follows.
+	// len == cap so the partial id can not be read past the slice.
+	truncated := make([]byte, 8+idLen-5)
+	le := binary.LittleEndian
+	le.PutUint32(truncated[0:], 1)
+	le.PutUint32(truncated[4:], 1)
+	_, err = decodePeerState(truncated)
+	require_Error(t, err, errCorruptPeers)
+}
+
 func TestNRGRecoverFromFollowingNoLeader(t *testing.T) {
 	c := createJetStreamClusterExplicit(t, "R3S", 3)
 	defer c.shutdown()
@@ -703,7 +723,7 @@ func TestNRGAssumeHighTermAfterCandidateIsolation(t *testing.T) {
 	// The candidate will shortly send a vote request. When that happens,
 	// the rest of the nodes in the cluster should move up to that term,
 	// even though they will not grant the vote.
-	nterm := follower.term
+	nterm := follower.Term()
 	for _, n := range rg {
 		require_Equal(t, n.node().Term(), nterm)
 	}
@@ -3111,6 +3131,34 @@ func TestNRGVoteResponseEncoding(t *testing.T) {
 	require_True(t, reflect.DeepEqual(decodeVoteResponse(res), vr))
 }
 
+func TestNRGDoesntRequestVoteOnWriteError(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	// Snoop on the vote request subject so we can tell whether we campaign.
+	nc, err := nats.Connect(n.s.ClientURL(), nats.UserInfo("admin", "s3cr3t!"))
+	require_NoError(t, err)
+	defer nc.Close()
+
+	sub, err := nc.SubscribeSync(n.vsubj)
+	require_NoError(t, err)
+	defer sub.Unsubscribe()
+	require_NoError(t, nc.Flush())
+
+	// Specifically not using setWriteError here because that shuts down the node
+	// and causes problems with the defer cleanup.
+	n.werr = errors.New("test write error")
+	n.state.Store(int32(Candidate))
+
+	// We can't persist our own vote, so asking for votes must be a no-op,
+	// otherwise after a restart we could vote for someone else in this term.
+	n.requestVote()
+
+	// Nothing should have been published to the vote subject.
+	_, err = sub.NextMsg(250 * time.Millisecond)
+	require_Error(t, err, nats.ErrTimeout)
+}
+
 func TestNRGInitializeAndScaleUp(t *testing.T) {
 	n, cleanup := initSingleMemRaftNode(t)
 	defer cleanup()
@@ -5159,9 +5207,10 @@ func TestNRGAppendEntryResurrectsLeader(t *testing.T) {
 
 	S2 := "z3WIzPtj" // S-2
 
+	n.Lock()
 	n.addPeer(S2)
-
-	require_Equal(t, len(n.peers), 2)
+	n.Unlock()
+	require_Len(t, len(n.Peers()), 2)
 	require_Equal(t, n.ClusterSize(), 2)
 
 	// PeerRemove S2
@@ -5175,7 +5224,7 @@ func TestNRGAppendEntryResurrectsLeader(t *testing.T) {
 		leader: S2, term: 1, commit: 1, pterm: 1, pindex: 1, entries: nil})
 	n.processAppendEntry(aeHeartBeat, n.aesub)
 
-	require_Equal(t, len(n.peers), 1)
+	require_Len(t, len(n.Peers()), 1)
 	require_Equal(t, n.ClusterSize(), 1)
 
 	// If bug is present: receiving a appendEntry from the old leader
@@ -5186,7 +5235,7 @@ func TestNRGAppendEntryResurrectsLeader(t *testing.T) {
 	n.processAppendEntry(aeHeartBeat2, n.aesub)
 
 	// Expect the cluster size to be unchanged
-	require_Equal(t, len(n.peers), 1)
+	require_Len(t, len(n.Peers()), 1)
 	require_Equal(t, n.ClusterSize(), 1)
 }
 
@@ -5424,6 +5473,55 @@ func TestNRGInstallSnapshotFromCheckpoint(t *testing.T) {
 	n.Unlock()
 	_, err = c.LoadLastSnapshot()
 	require_Error(t, err, errors.New("snapshot index mismatch"))
+}
+
+func TestNRGSnapshotCheckpointNodeClosed(t *testing.T) {
+	for _, test := range []struct {
+		title string
+		close func(n *raft)
+	}{
+		{title: "Stop", close: func(n *raft) { n.Stop() }},
+		{title: "Delete", close: func(n *raft) { n.Delete() }},
+	} {
+		t.Run(test.title, func(t *testing.T) {
+			n, cleanup := initSingleMemRaftNode(t)
+			defer cleanup()
+
+			// Create a sample entry, the content doesn't matter, just that it's stored.
+			esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, 0, 0, true)
+			entries := []*Entry{newEntry(EntryNormal, esm)}
+
+			nats0 := "S1Nunr6R" // "nats-0"
+
+			aeMsg := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 0, pindex: 0, entries: entries})
+			aeHeartbeat := encode(t, &appendEntry{leader: nats0, term: 1, commit: 1, pterm: 1, pindex: 1, entries: nil})
+
+			n.processAppendEntry(aeMsg, n.aesub)
+			n.processAppendEntry(aeHeartbeat, n.aesub)
+			require_Equal(t, n.commit, 1)
+			n.Applied(1)
+			require_Equal(t, n.applied, 1)
+
+			// Create the checkpoint while the node is still healthy.
+			c, err := n.CreateSnapshotCheckpoint(false)
+			require_NoError(t, err)
+
+			// Stop/delete the node.
+			test.close(n)
+
+			// All checkpoint paths must now report the node as closed.
+			_, err = c.LoadLastSnapshot()
+			require_Error(t, err, errNodeClosed)
+			var count int
+			for _, err = range c.AppendEntriesSeq() {
+				count++
+				require_Error(t, err, errNodeClosed)
+			}
+			require_Equal(t, count, 1) // Must always iterate at least once to retrieve the error.
+			_, err = c.InstallSnapshot(nil)
+			require_Error(t, err, errNodeClosed)
+		})
+	}
 }
 
 func TestNRGInstallSnapshotForce(t *testing.T) {
@@ -5911,8 +6009,10 @@ func TestNRGOnlyCommitIfCurrentTerm(t *testing.T) {
 	s2 := getHash("S-2")
 	s3 := getHash("S-3")
 
+	n.Lock()
 	n.addPeer(s2)
 	n.addPeer(s3)
+	n.Unlock()
 	require_Len(t, len(n.Peers()), 3)
 
 	// The below timeline describes a test ensuring a leader doesn't commit entries from previous terms.
